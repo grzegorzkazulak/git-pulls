@@ -1,7 +1,6 @@
-require 'rubygems'
 require 'json'
-require 'httparty'
-require 'pp'
+require 'launchy'
+require 'octokit'
 
 class GitPulls
 
@@ -18,6 +17,7 @@ class GitPulls
   end
 
   def run
+    configure
     if @command && self.respond_to?(@command)
       # If the cache file doesn't exist, make sure we run update
       # before any other command. git-pulls will otherwise crash
@@ -33,7 +33,7 @@ class GitPulls
   end
 
   ## COMMANDS ##
- 
+
   def help
     puts "No command: #{@command}"
     puts "Try: update, list, show, merge, browse"
@@ -104,7 +104,7 @@ Usage: git pulls update
   def browse
     num = @args.shift
     if p = pull_num(num)
-      `open #{p['html_url']}`
+      Launchy.open(p['html_url'])
     else
       puts "No such number"
     end
@@ -112,9 +112,10 @@ Usage: git pulls update
 
   def list
     option = @args.shift
-    puts "Open Pull Requests for #{@user}/#{@repo}" 
+    puts "Open Pull Requests for #{@user}/#{@repo}"
     pulls = get_pull_info
     pulls.reverse! if option == '--reverse'
+    count = 0
     pulls.each do |pull|
       line = []
       line << l(pull['number'], 4)
@@ -125,12 +126,16 @@ Usage: git pulls update
       sha = pull['head']['sha']
       if not_merged?(sha)
         puts line.join ' '
+        count += 1
       end
+    end
+    if count == 0
+      puts ' -- no open pull requests --'
     end
   end
 
   def update
-    puts "Updating #{@user}/#{@repo}" 
+    puts "Updating #{@user}/#{@repo}"
     cache_pull_info
     fetch_stale_forks
     list
@@ -156,7 +161,18 @@ Usage: git pulls update
     end
     repos.each do |repo, bool|
       puts "  fetching #{repo}"
-      git("fetch #{protocol(is_private)}github.com/#{repo}.git refs/heads/*:refs/pr/#{repo}/*")
+      git("fetch #{protocol(get_repo_visibility)}#{github_url}/#{repo}.git +refs/heads/*:refs/pr/#{repo}/*")
+    end
+  end
+
+  def protocol(is_private)
+    is_private ? "ssh://git@" : "git://"
+  end
+
+  def get_repo_visibility
+    # This would fail if the repository was private and user did not provide github token
+    if github_credentials_provided?
+      Octokit.repository("#{repo_info[0]}/#{repo_info[1]}").private
     end
   end
 
@@ -169,7 +185,6 @@ Usage: git pulls update
     commits = git("rev-list #{sha} ^HEAD 2>&1")
     commits.split("\n").size > 0
   end
-
 
   # DISPLAY HELPER FUNCTIONS #
 
@@ -185,15 +200,18 @@ Usage: git pulls update
     info.to_s.gsub("\n", ' ')
   end
 
-
   # PRIVATE REPOSITORIES ACCESS
-  
-  def github_username
-    git("config --get-all github.user")
+
+  def configure
+    Octokit.configure do |config|
+      config.login = github_login
+      config.token = github_token
+      config.endpoint = github_endpoint
+    end
   end
-  
-  def github_token
-    git("config --get-all github.token")
+
+  def github_login
+    git("config --get-all github.user")
   end
 
   # API/DATA HELPER FUNCTIONS #
@@ -219,10 +237,36 @@ Usage: git pulls update
     path = "/pulls/#{@user}/#{@repo}/open"
     response = HTTParty.get('https://github.com/api/v2/json' << path, authentication_options)
     save_data(response, PULLS_CACHE_FILE)
+
+  def github_endpoint
+    host = git("config --get-all github.host")
+    if host.size > 0
+      host
+    else
+      'https://github.com/'
+    end
+  end
+
+  # API/DATA HELPER FUNCTIONS #
+
+  def github_credentials_provided?
+    if github_token.empty? && github_login.empty?
+      return false
+    end
+    true
+  end
+
+  def get_pull_info
+    get_data(PULLS_CACHE_FILE)['pulls']
   end
 
   def get_data(file)
     data = JSON.parse(File.read(file))
+  end
+
+  def cache_pull_info
+    response = Octokit.pull_requests("#{@user}/#{@repo}")
+    save_data({'pulls' => response}, PULLS_CACHE_FILE)
   end
 
   def save_data(data, file)
@@ -236,16 +280,15 @@ Usage: git pulls update
     data.select { |p| p['number'].to_s == num.to_s }.first
   end
 
-
   def repo_info
     c = {}
     config = git('config --list')
-    config.split("\n").each do |line| 
+    config.split("\n").each do |line|
       k, v = line.split('=')
       c[k] = v
     end
     u = c['remote.origin.url']
-    if m = /github\.com.(.*?)\/(.*?)\.git/.match(u)
+    if m = /github\.com.(.*?)\/(.*)\.git/.match(u)
       user = m[1]
       proj = m[2]
     end
